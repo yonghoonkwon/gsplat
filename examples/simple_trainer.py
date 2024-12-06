@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+import struct
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -41,6 +42,7 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
+from plyfile import PlyData, PlyElement
 
 
 @dataclass
@@ -85,7 +87,9 @@ class Config:
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
@@ -128,7 +132,11 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
-
+    # Anisotropy regularization
+    anisotropy_scale_reg: float = 0.0
+    # Threshold of ratio of gaussian max to min scale before applying anisotropy regularization loss from the PhysGaussian paper
+    max_gauss_ratio: float = 10.0
+        
     # Enable camera optimization.
     pose_opt: bool = False
     # Learning rate for camera optimization
@@ -167,6 +175,7 @@ class Config:
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
+        self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
@@ -270,6 +279,98 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
+
+def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
+    # Convert all tensors to numpy arrays in one go
+    print(f"Saving ply to {dir}")
+    numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+
+    means = numpy_data["means"]
+    scales = numpy_data["scales"]
+    quats = numpy_data["quats"]
+    opacities = numpy_data["opacities"]
+
+    sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1)
+    shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1)
+
+    # Create a mask to identify rows with NaN or Inf in any of the numpy_data arrays
+    invalid_mask = (
+        np.isnan(means).any(axis=1)
+        | np.isinf(means).any(axis=1)
+        | np.isnan(scales).any(axis=1)
+        | np.isinf(scales).any(axis=1)
+        | np.isnan(quats).any(axis=1)
+        | np.isinf(quats).any(axis=1)
+        | np.isnan(opacities).any(axis=0)
+        | np.isinf(opacities).any(axis=0)
+        | np.isnan(sh0).any(axis=1)
+        | np.isinf(sh0).any(axis=1)
+        | np.isnan(shN).any(axis=1)
+        | np.isinf(shN).any(axis=1)
+    )
+
+    # Filter out rows with NaNs or Infs from all data arrays
+    means = means[~invalid_mask]
+    scales = scales[~invalid_mask]
+    quats = quats[~invalid_mask]
+    opacities = opacities[~invalid_mask]
+    sh0 = sh0[~invalid_mask]
+    shN = shN[~invalid_mask]
+
+    num_points = means.shape[0]
+
+    with open(dir, "wb") as f:
+        # Write PLY header
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(f"element vertex {num_points}\n".encode())
+        f.write(b"property float x\n")
+        f.write(b"property float y\n")
+        f.write(b"property float z\n")
+        f.write(b"property float nx\n")
+        f.write(b"property float ny\n")
+        f.write(b"property float nz\n")
+
+        if colors is not None:
+            for j in range(colors.shape[1]):
+                f.write(f"property float f_dc_{j}\n".encode())
+        else:
+            for i, data in enumerate([sh0, shN]):
+                prefix = "f_dc" if i == 0 else "f_rest"
+                for j in range(data.shape[1]):
+                    f.write(f"property float {prefix}_{j}\n".encode())
+
+        f.write(b"property float opacity\n")
+
+        for i in range(scales.shape[1]):
+            f.write(f"property float scale_{i}\n".encode())
+        for i in range(quats.shape[1]):
+            f.write(f"property float rot_{i}\n".encode())
+
+        f.write(b"end_header\n")
+
+        # Write vertex data
+        for i in range(num_points):
+            f.write(struct.pack("<fff", *means[i]))  # x, y, z
+            f.write(struct.pack("<fff", 0, 0, 0))  # nx, ny, nz (zeros)
+
+            if colors is not None:
+                color = colors.detach().cpu().numpy()
+                for j in range(color.shape[1]):
+                    f_dc = (color[i, j] - 0.5) / 0.2820947917738781
+                    f.write(struct.pack("<f", f_dc))
+            else:
+                for data in [sh0, shN]:
+                    for j in range(data.shape[1]):
+                        f.write(struct.pack("<f", data[i, j]))
+
+            f.write(struct.pack("<f", opacities[i]))  # opacity
+
+            for data in [scales, quats]:
+                for j in range(data.shape[1]):
+                    f.write(struct.pack("<f", data[i, j]))
+
+
 class Runner:
     """Engine for training and testing."""
 
@@ -294,7 +395,9 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
-
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
+        
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
@@ -569,11 +672,14 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            gt_alphas = data['gt_alphas'].to(device).unsqueeze(-1) / 255.0 # [1, H, W, 1]
+                        
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+                        
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -606,7 +712,7 @@ class Runner:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
-
+                        
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -615,7 +721,7 @@ class Runner:
                 )
                 grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
                 colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
-
+                        
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
@@ -627,13 +733,23 @@ class Runner:
                 step=step,
                 info=info,
             )
+            
+            # apply alpha mask
+            rng_rgb = torch.rand(1, height, width, 3, device=self.device)
+            alpha_mask = gt_alphas.float()
+            colors = colors * alpha_mask + rng_rgb * (1.0 - alpha_mask)
+            pixels = pixels * alpha_mask + rng_rgb * (1.0 - alpha_mask)
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
+            alphaloss = F.l1_loss(alphas, gt_alphas) * 0.2
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + \
+                    alphaloss * (1.0 - cfg.ssim_lambda) + \
+                    ssimloss * cfg.ssim_lambda
+            
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -669,7 +785,21 @@ class Runner:
                     loss
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
+            
+            if cfg.anisotropy_scale_reg > 0.0:
+                scale_exp = torch.exp(self.splats["scales"])
+                anisotropy_reg = (
+                    torch.maximum(
+                        scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                        torch.tensor(cfg.max_gauss_ratio),
+                    )
+                    - cfg.max_gauss_ratio
+                )
 
+                loss = (
+                    loss + cfg.anisotropy_scale_reg * 0.1 * anisotropy_reg.mean()
+                )
+                 
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -694,6 +824,7 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                self.writer.add_scalar("train/alphaloss", alphaloss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
@@ -736,6 +867,21 @@ class Runner:
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
 
+            if step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1:
+                rgb = None
+                if self.cfg.app_opt:
+                    # eval at origin to bake the appeareance into the colors
+                    rgb = self.app_module(
+                        features=self.splats["features"],
+                        embed_ids=None,
+                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        sh_degree=sh_degree_to_use,
+                    )
+                    rgb = rgb + self.splats["colors"]
+                    rgb = torch.sigmoid(rgb).squeeze(0)
+
+                save_ply(self.splats, f"{self.ply_dir}/point_cloud_{step}.ply", rgb)
+            
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -1013,7 +1159,6 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
-
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
@@ -1021,27 +1166,33 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             print("Viewer is disabled in distributed training.")
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
-
-    if cfg.ckpt is not None:
-        # run eval only
-        ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
+    
+    ckpt_file = f"{runner.ckpt_dir}/ckpt_{cfg.max_steps-1}_rank{runner.world_rank}.pt"
+    if os.path.exists(ckpt_file):
+        ckpts = [torch.load(ckpt_file, map_location=runner.device)]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
-        runner.eval(step=step)
-        runner.render_traj(step=step)
-        if cfg.compression is not None:
-            runner.run_compression(step=step)
     else:
-        runner.train()
+        if cfg.ckpt is not None:
+            # run eval only
+            ckpts = [
+                torch.load(file, map_location=runner.device, weights_only=True)
+                for file in cfg.ckpt
+            ]
+            for k in runner.splats.keys():
+                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            step = ckpts[0]["step"]
+            runner.eval(step=step)
+            runner.render_traj(step=step)
+            if cfg.compression is not None:
+                runner.run_compression(step=step)
+        else:
+            runner.train()
 
+    
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
-
 
 if __name__ == "__main__":
     """

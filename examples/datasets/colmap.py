@@ -47,7 +47,7 @@ class Parser:
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
-
+        
         manager = SceneManager(colmap_dir)
         manager.load_cameras()
         manager.load_images()
@@ -64,6 +64,7 @@ class Parser:
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
+            
             rot = im.R()
             trans = im.tvec.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
@@ -215,6 +216,7 @@ class Parser:
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
         actual_height, actual_width = actual_image.shape[:2]
         colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
+        
         s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
         for camera_id, K in self.Ks_dict.items():
             K[0, :] *= s_width
@@ -222,7 +224,7 @@ class Parser:
             self.Ks_dict[camera_id] = K
             width, height = self.imsize_dict[camera_id]
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
-
+        
         # undistortion
         self.mapx_dict = dict()
         self.mapy_dict = dict()
@@ -324,13 +326,20 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        image_ = imageio.imread(self.parser.image_paths[index])
+        image = image_[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        alpha_mask = None
+        if image_.shape[-1] == 4:
+            alpha_mask = image_[..., -1]
+        else:
+            alpha_mask = np.ones_like(image_[..., 0]) * 255
+        
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -340,6 +349,8 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            alpha_mask = cv2.remap(alpha_mask, mapx, mapy, cv2.INTER_LINEAR)
+            alpha_mask = alpha_mask[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.
@@ -347,18 +358,24 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            alpha_mask = alpha_mask[y : y + h, x : x + w]
             K[0, 2] -= x
             K[1, 2] -= y
-
+        
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
+            "gt_alphas": torch.from_numpy(alpha_mask).float(),
             "image_id": item,  # the index of the image in the dataset
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
-
+        
+        if alpha_mask is not None:
+            data["mask"] = (torch.from_numpy(alpha_mask).float() / 255.0)
+            data["mask"] = (data["mask"] > 0.5).bool()
+            
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
